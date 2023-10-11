@@ -24,6 +24,8 @@ class GraphAttention(nn.Module):
         use_exp: If set to `True`, use the exponential of the predicted
           weights to trade-off global and local attention.
     """
+    __gamma_dim__ = 2
+
     def __init__(self,
                  dim: int,
                  num_heads: int = 8,
@@ -39,7 +41,7 @@ class GraphAttention(nn.Module):
         self.proj = nn.Linear(dim * num_heads, dim)
         
         # Weigth to trade of local vs. global attention.
-        self.predict_gamma = nn.Linear(dim, 2)
+        self.predict_gamma = nn.Linear(dim, self.__class__.__gamma_dim__)
         # Initialize projection such that gamma is close to 1
         # in the beginning of training.
         self.predict_gamma.weight.data.uniform_(0.0, 0.01)
@@ -48,29 +50,50 @@ class GraphAttention(nn.Module):
     @torch.jit.script
     def fused_mul_add(a, b, c, d):
         return (a * b) + (c * d)
+    
+    @torch.jit.script
+    def double_fused_mul_add(a, b, c, d, e, f):
+        return (a * b) + (c * d) + (e * f)
 
     def forward(self, x, adj):
         B, N, C = x.shape # (batch x num_nodes x feat_dim)
+        # batch x num_nodes x dim * num_heads * 3
         qkv = self.qkv_projection(x).view(B, N, 3, self.num_heads, self.dim).permute(0, 3, 1, 2, 4)
         query, key, value = qkv.unbind(dim=3) # (batch x num_heads x num_nodes x dim)
 
         attn = (query @ key.transpose(-2, -1)) * self.scale # (batch x num_heads x num_nodes x num_nodes)
 
         # Predict trade-off weight per node
+        # batch x num_nodes x gamma_dim => batch x num_heads x num_nodes x gamma_dim
         gamma = self.predict_gamma(x)[:, None].repeat(1, self.num_heads, 1, 1)
         if self.use_exp:
             # Parameterize gamma to always be positive
             gamma = torch.exp(gamma)
 
+        # batch x num_nodes x num_nodes => batch x num_heads x num_nodes x num_nodes
         adj = adj[:, None].repeat(1, self.num_heads, 1, 1)
 
-        # Compute trade-off between local and global attention.
-        attn = self.fused_mul_add(gamma[:, :, :, 0:1], attn, gamma[:, :, :, 1:2], adj)
+        if self.__class__.__gamma_dim__ == 2:
+            # Compute trade-off between local and global attention.
+            # batch x num_heads x num_nodes x 1 * batch x num_heads x num_nodes x num_nodes
+            # => batch x num_heads x num_nodes x num_nodes
+            attn = self.fused_mul_add(gamma[:, :, :, 0:1], attn, gamma[:, :, :, 1:2], adj)
+        else:
+            attn = self.double_fused_mul_add(gamma[:, :, :, 0:1], attn,
+                                             gamma[:, :, :, 1:2], adj,
+                                             gamma[:, :, :, 2:3], adj.transpose(-2, -1))
         
         attn = attn.softmax(dim=-1)
 
+        # batch x num_heads x num_nodes x num_nodes @ batch x num_heads x num_nodes x dim
+        # => batch x num_heads x num_nodes x dim
+        # transpose: batch x num_nodes x num_heads x dim
+        # reshape: batch x num_nodes x num_heads * dim
         x = (attn @ value).transpose(1, 2).reshape(B, N, -1) # (batch_size x num_nodes x (num_heads * dim))
         return self.proj(x)
+    
+class DiGraphAttention(GraphAttention):
+    __gamma_dim__ = 3
     
     
 class MLP(nn.Module):
@@ -94,10 +117,14 @@ class AttentionBlock(nn.Module):
                  mlp_ratio: int = 4,
                  bias: bool = False,
                  use_exp: bool = True,
+                 is_directed: bool = False,
                  norm_layer: Any = nn.LayerNorm) -> nn.Module:
         super().__init__()
         self.norm1 = norm_layer(dim)
-        self.attn = GraphAttention(dim, num_heads=num_heads, bias=bias, use_exp=use_exp)
+        if is_directed:
+            self.attn = DiGraphAttention(dim, num_heads=num_heads, bias=bias, use_exp=use_exp)
+        else:
+            self.attn = GraphAttention(dim, num_heads=num_heads, bias=bias, use_exp=use_exp)
         self.norm2 = norm_layer(dim)
         self.mlp = MLP(dim=dim, hidden_dim=dim * mlp_ratio)
 
@@ -120,15 +147,16 @@ class GraphTransformer(nn.Module):
                  num_classes: int = 1000,
                  pos_dim: int = 32,
                  proj_dim: int = 128,
-                 use_exp: bool = True) -> nn.Module:
+                 use_exp: bool = True,
+                 is_directed: bool = False) -> nn.Module:
         super().__init__()
 
         self.cls_token = nn.Parameter(torch.randn(1, 1, dim))
         self.cls_pos_embedding = nn.Parameter(torch.randn(1, 1, dim))
 
         self.blocks = nn.Sequential(*[
-            AttentionBlock(dim=dim, num_heads=num_heads, mlp_ratio=mlp_ratio, use_exp=use_exp)
-            for i in range(depth)])
+            AttentionBlock(dim=dim, num_heads=num_heads, mlp_ratio=mlp_ratio, use_exp=use_exp, is_directed=is_directed)
+            for _ in range(depth)])
 
         self.to_pos_embedding = nn.Linear(pos_dim, dim)
 
@@ -158,16 +186,24 @@ class GraphTransformer(nn.Module):
         B, N, _ = node_feat.shape
 
         # Compute initial node embedding.
+        # node_feat: batch x num_nodes x feat_dim
+        # batch x num_nodes x dim
         x = self.to_node_embedding(node_feat)
 
         # Compute positional encoding
+        # lap1: batch x num_nodes * pos_dim
+        # batch x num_nodes x dim
         pos_embedding_token = self.to_pos_embedding(lapl)
 
         # Add "classification" token
+        # batch x 1 x dim
         cls_pos_enc = self.cls_pos_embedding.repeat(B, 1, 1)
+        # batch x num_nodes + 1 x dim
         pos_embedding = torch.cat((cls_pos_enc, pos_embedding_token), dim=1)
 
+        # batch x 1 x dim
         cls_tokens = self.cls_token.repeat(B, 1, 1)
+        # batch x num_nodes + 1 x dim
         x = torch.cat((cls_tokens, x), dim=1)
 
         # Add classification token entry to adjanceny matrix. 
@@ -179,7 +215,7 @@ class GraphTransformer(nn.Module):
         x += pos_embedding
         for block in self.blocks:
             x = block(x, adj_cls)
-        x = x[:, 0]
+        x = x[:, 0]  # BUT WHY THOUGH!?
         x = self.mlp_head(x)
 
         return x, self.projector(x)
@@ -294,7 +330,8 @@ def create_model(config):
                  num_heads=config['model']['n_head'],
                  feat_dim=config['data']['feat_dim'],
                  pos_dim=config['model']['pos_dim'],
-                 num_classes=num_classes)
+                 num_classes=num_classes,
+                 is_directed=config['model'].get('directed', False))
 
     # Create GraphDINO.
     model = GraphDINO(transformer,
